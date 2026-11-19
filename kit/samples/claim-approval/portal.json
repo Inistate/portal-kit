@@ -1,0 +1,42 @@
+{
+  "slug": "claim-approval",
+  "name": "Approve a claim",
+  "icon": "tasks",
+  "kind": "activity",
+  "server": "internal",
+  "workspace": 136,
+  "port": 5174,
+  "visibleTo": "Everyone",
+  "platforms": [
+    "web",
+    "app"
+  ],
+  "activity": {
+    "module": "Expense Claims",
+    "moduleId": 4242,
+    "activity": "Approve",
+    "activityId": "5d2e7c1a-9b3f-4a60-8e21-7f4c0b9d3a18",
+    "onEntry": true
+  },
+  "reads": [],
+  "submits": [
+    {
+      "module": "Expense Claims",
+      "activity": "Approve",
+      "activityId": "5d2e7c1a-9b3f-4a60-8e21-7f4c0b9d3a18",
+      "fields": {
+        "Claim No.": "Text",
+        "Employee": "Text",
+        "Claim Date": "Date",
+        "Amount": "Currency",
+        "Approved Amount": "Currency",
+        "Payment Date": "Date",
+        "Approval Slip": "File",
+        "Remarks": "Text"
+      },
+      "required": [
+        "Approved Amount"
+      ]
+    }
+  ]
+}

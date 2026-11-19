@@ -1,0 +1,1170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<!-- The page holds the member's session: it may only talk to the Inistate APIs named below, and loads nothing but its own files beside it. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src https://api.inistate.com https://app02.apps.inistate.com https://gneysoftware.apps.inistate.com https://test.apps.inistate.com; base-uri 'none'; form-action 'none'">
+<meta name="inistate-portal" content="1">
+<!-- inistate-portal-sdk:begin: sdk/portal-v1.js pasted unchanged by dev/inline-sdk.js. It must stay the first script: it takes Inistate's launch code out of the address before anything else runs. -->
+<script>
+/*! Inistate portal SDK v1.1 — docs/integration-portal-link-proposal.md §4.7, and §3.8 of
+ * docs/integration-portal-claude-design-proposal.md (Inistate SVN trunk).
+ *
+ * A portal page is a static page on https://e.inistate.com that members open from Inistate (web: a new tab;
+ * mobile app: a full-screen web view). Inistate hands the page a single-use launch code in the URL fragment;
+ * this file swaps it for the page's own, short-lived session and keeps it for this tab only.
+ *
+ *   const s = await InistatePortal.start();          // null when the page was not opened from Inistate
+ *   const res = await s.fetch('/v1/list', { method: 'POST', body: { module: 'Invoices' } });
+ *   s.on('ended', reason => showOpenAgain());
+ *
+ * v1.1:
+ *  - s.context is { moduleId, activityId, entryId } when an activity opened the page (bound to the session by the
+ *    server, never read from the address), or null for a launch from the Portals menu.
+ *  - s.done({ entryId }) ends an activity page: the app closes it; the web closes the tab, or says it can be closed.
+ *  - start() also works on a page served from this computer (http://localhost:<port>, http://127.0.0.1:<port>),
+ *    which is where a workspace admin's debug launch sends their session. The API addresses accepted are the same.
+ *
+ * Rules this file keeps (do not loosen them in a page):
+ *  - The fragment is read and removed from the address before any other script on the page runs (load this
+ *    file first, inline, in <head>).
+ *  - Only API and app addresses on the built-in lists are accepted; the page's own CSP connect-src is the
+ *    second lock.
+ *  - Tokens live in memory and in sessionStorage (this tab only), never in localStorage, cookies or URLs.
+ *  - Paste this file into the page unchanged; a page never edits the copy it carries.
+ */
+(function (global) {
+  'use strict';
+
+  var VERSION = '1.1';
+  var RECORD_VERSION = '1';          // the shape kept in sessionStorage; v1.1 only adds "context" to it
+  var STORAGE_KEY = 'inistate.portal.session';
+  var DEBUG_PORTAL = 'debug';        // the portal id of a debug session (no portal record)
+  var DONE_NOTE_ID = 'inistate-portal-done';
+  var REFRESH_AT = 0.8;              // of the access token's remaining life
+  var MIN_REFRESH_DELAY = 5000;
+  var RETRY_DELAYS = [5000, 15000, 30000];
+
+  var API_HOSTS = [
+    'https://api.inistate.com',
+    'https://app02.apps.inistate.com',
+    'https://gneysoftware.apps.inistate.com',
+    'https://test.apps.inistate.com'
+  ];
+  var APP_HOSTS = [
+    'https://app.inistate.com',
+    'https://app02.apps.inistate.com',
+    'https://gneysoftware.apps.inistate.com',
+    'https://test.apps.inistate.com'
+  ];
+
+  // ---- 1. capture and strip the launch fragment, at load time, before anything else runs ----
+  var launch = null;
+  (function capture() {
+    try {
+      var hash = global.location.hash || '';
+      if (hash.indexOf('plc=') < 0) return;
+      var params = {};
+      hash.replace(/^#/, '').split('&').forEach(function (pair) {
+        var eq = pair.indexOf('=');
+        if (eq > 0) {
+          try { params[pair.slice(0, eq)] = decodeURIComponent(pair.slice(eq + 1)); } catch (e) { /* ignore a bad pair */ }
+        }
+      });
+      if (params.plc) launch = { code: params.plc, api: params.api || '', app: params.app || '', host: params.host || 'web' };
+    } catch (e) {
+      launch = null;
+    }
+    try {
+      global.history.replaceState(null, '', global.location.pathname + global.location.search);
+    } catch (e) {
+      // A frame may refuse replaceState; the code is single-use and short-lived either way.
+      try { global.location.hash = ''; } catch (e2) { /* nothing more to do */ }
+    }
+  })();
+
+  function origin(value) {
+    try {
+      var u = new URL(value);
+      return u.protocol + '//' + u.host;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function allowed(value, list) {
+    var o = origin(value);
+    return !!o && list.indexOf(o) >= 0 ? o : null;
+  }
+
+  function decodeJwt(token) {
+    try {
+      var part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (part.length % 4) part += '=';
+      return JSON.parse(decodeURIComponent(Array.prototype.map.call(atob(part), function (c) {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join('')));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function readStored() {
+    try {
+      var raw = global.sessionStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function writeStored(record) {
+    try {
+      if (record) global.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(record));
+      else global.sessionStorage.removeItem(STORAGE_KEY);
+    } catch (e) { /* private mode: the session still lives in memory */ }
+  }
+
+  function timeZone() {
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; }
+  }
+
+  function hostBridge(message) {
+    try {
+      if (global.InistatePortalHost && typeof global.InistatePortalHost.postMessage === 'function') {
+        global.InistatePortalHost.postMessage(JSON.stringify(message));
+        return true;
+      }
+    } catch (e) { /* not inside the app */ }
+    return false;
+  }
+
+  // After done() on the web, when the browser keeps the tab open: one note over the page, nothing more.
+  function showDoneNote() {
+    var doc = global.document;
+    if (!doc || !doc.body || doc.getElementById(DONE_NOTE_ID)) return;
+    var note = doc.createElement('div');
+    note.id = DONE_NOTE_ID;
+    note.setAttribute('role', 'status');
+    note.textContent = api.doneNote || 'You can close this tab.';
+    note.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;'
+      + 'padding:24px;background:rgba(255,255,255,.97);color:#1f2933;font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;text-align:center';
+    doc.body.appendChild(note);
+  }
+
+  // ---- 2. the token endpoint ----
+  function tokenCall(api, grant) {
+    return fetch(api + '/Token', {
+      method: 'POST',
+      credentials: 'omit',
+      cache: 'no-store',
+      referrerPolicy: 'no-referrer',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=refresh_token&refresh_token=' + encodeURIComponent(grant)
+    }).then(function (res) {
+      return res.text().then(function (text) {
+        var body = null;
+        try { body = text ? JSON.parse(text) : null; } catch (e) { body = null; }
+        return { ok: res.ok, status: res.status, body: body };
+      });
+    });
+  }
+
+  // The activity that opened the page: the token answer's portal_context, a JSON string, on the launch and on every
+  // refresh. Anything that is not a JSON object is no context.
+  function contextFrom(raw) {
+    try {
+      var value = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function recordFrom(answer, base) {
+    var body = answer.body || {};
+    var access = body.access_token;
+    var claims = decodeJwt(access) || {};
+    var exp = claims.exp ? claims.exp * 1000
+      : (body.access_expires_at ? Date.parse(body.access_expires_at) : Date.now() + (Number(body.expires_in) || 3600) * 1000);
+    return {
+      v: RECORD_VERSION,
+      api: base.api,
+      app: base.app,
+      host: base.host,
+      portalId: body.portal_id || claims['inistate:portal'] || base.portalId || null,
+      workspaceId: body.workspace_id || base.workspaceId || null,
+      context: body.portal_context !== undefined ? contextFrom(body.portal_context) : (base.context || null),
+      sessionEnd: body.session_expires_at ? Date.parse(body.session_expires_at) : (base.sessionEnd || null),
+      access: access,
+      refresh: body.refresh_token || null,
+      exp: exp,
+      user: {
+        id: claims.nameid || claims.sub || (base.user && base.user.id) || null,
+        username: claims.unique_name || claims.name || (base.user && base.user.username) || null
+      }
+    };
+  }
+
+  // ---- 3. the session ----
+  function Session(record) {
+    this._r = record;
+    this._listeners = { ended: [], refreshed: [] };
+    this._refreshing = null;
+    this._timer = null;
+    this._ended = false;
+    this.host = record.host === 'app' ? 'app' : 'web';
+    this.api = record.api;
+    this.app = record.app;
+    this.user = record.user;
+    this.workspace = { id: record.workspaceId };
+    this.portal = { id: record.portalId };
+    this.context = record.context || null;
+    this.can = this.host === 'app'
+      ? { camera: false, download: false, print: false, newTab: false }
+      : { camera: !!(global.navigator && global.navigator.mediaDevices), download: true, print: true, newTab: true };
+    this._schedule();
+  }
+
+  Session.prototype.on = function (event, fn) {
+    if (this._listeners[event] && typeof fn === 'function') this._listeners[event].push(fn);
+    return this;
+  };
+
+  Session.prototype._emit = function (event, detail) {
+    (this._listeners[event] || []).forEach(function (fn) {
+      try { fn(detail); } catch (e) { /* a listener's error is the page's own */ }
+    });
+  };
+
+  Session.prototype._schedule = function () {
+    var self = this;
+    if (self._timer) clearTimeout(self._timer);
+    if (self._ended || !self._r.refresh) return;
+    var remaining = self._r.exp - Date.now();
+    var delay = Math.max(MIN_REFRESH_DELAY, Math.floor(remaining * REFRESH_AT));
+    self._timer = setTimeout(function () { self.refresh().catch(function () { /* reported through 'ended' */ }); }, delay);
+  };
+
+  /** Rotates the refresh token for a fresh access token. One refresh at a time. */
+  Session.prototype.refresh = function () {
+    var self = this;
+    if (self._ended) return Promise.reject(new Error('ended'));
+    if (self._refreshing) return self._refreshing;
+    if (!self._r.refresh) {
+      self._end('no_refresh_token');
+      return Promise.reject(new Error('ended'));
+    }
+
+    var attempt = 0;
+    function once() {
+      return tokenCall(self._r.api, self._r.refresh).then(function (answer) {
+        if (answer.ok && answer.body && answer.body.access_token) {
+          self._r = recordFrom(answer, self._r);
+          writeStored(self._r);
+          self.user = self._r.user;
+          self.context = self._r.context || null;
+          self._schedule();
+          self._emit('refreshed', { expiresAt: self._r.exp });
+          return self._r.access;
+        }
+        // 400 invalid_grant: the session is over (12 h reached, ended by an admin or a sign-out, or reused).
+        self._end('refresh_refused');
+        throw new Error('ended');
+      }, function (networkError) {
+        if (attempt < RETRY_DELAYS.length) {
+          var wait = RETRY_DELAYS[attempt++];
+          return new Promise(function (resolve) { setTimeout(resolve, wait); }).then(once);
+        }
+        self._end('unreachable');
+        throw networkError;
+      });
+    }
+
+    self._refreshing = once().then(function (token) {
+      self._refreshing = null;
+      return token;
+    }, function (error) {
+      self._refreshing = null;
+      throw error;
+    });
+    return self._refreshing;
+  };
+
+  /** A valid access token, refreshed first when it is about to run out. */
+  Session.prototype.token = function () {
+    if (this._ended) return Promise.reject(new Error('ended'));
+    if (this._r.exp - Date.now() < 30000) return this.refresh();
+    return Promise.resolve(this._r.access);
+  };
+
+  /** The headers every Inistate API call needs (for a page that builds its own request, e.g. an upload). */
+  Session.prototype.headers = function () {
+    var self = this;
+    return self.token().then(function (token) {
+      return { Authorization: 'Bearer ' + token, wsId: String(self._r.workspaceId), tz: timeZone() };
+    });
+  };
+
+  /**
+   * fetch() against the Inistate API: path is relative to the API base. A plain-object body is sent as JSON.
+   * On a 401 the token is refreshed once and the call retried; an ended session fires 'ended'.
+   */
+  Session.prototype.fetch = function (path, options) {
+    var self = this;
+    options = options || {};
+    var send = function (retried) {
+      return self.headers().then(function (headers) {
+        var init = {
+          method: options.method || 'GET',
+          credentials: 'omit',
+          cache: 'no-store',
+          referrerPolicy: 'no-referrer',
+          headers: Object.assign({}, headers, options.headers || {})
+        };
+        if (options.body !== undefined) {
+          if (options.body !== null && typeof options.body === 'object' && !(options.body instanceof FormData)
+            && !(options.body instanceof Blob) && !(options.body instanceof URLSearchParams)) {
+            init.body = JSON.stringify(options.body);
+            init.headers['Content-Type'] = init.headers['Content-Type'] || 'application/json';
+          } else {
+            init.body = options.body;
+          }
+        }
+        return fetch(self._r.api + path, init);
+      }).then(function (res) {
+        if (res.status !== 401) return res;
+        return res.clone().json().catch(function () { return null; }).then(function (body) {
+          if (body && body.error === 'portal_session_ended') {
+            self._end('session_ended');
+            return res;
+          }
+          if (retried) return res;
+          return self.refresh().then(function () { return send(true); }, function () { return res; });
+        });
+      });
+    };
+    return send(false);
+  };
+
+  /** Inside the app, hide (false) or show (true) the app's own close button when the page draws its own. */
+  Session.prototype.setHostClose = function (visible) {
+    if (this.host === 'app') hostBridge({ type: 'hostClose', visible: !!visible });
+  };
+
+  /** Closes the portal: the tab on the web, the full-screen page in the app. */
+  Session.prototype.close = function () {
+    if (this.host === 'app' && hostBridge({ type: 'close' })) return;
+    var app = this._r.app;
+    try { global.close(); } catch (e) { /* not script-opened */ }
+    setTimeout(function () { if (!global.closed && app) global.location.assign(app + '/#/'); }, 300);
+  };
+
+  /**
+   * Opens the portal again from Inistate (a fresh launch, silent while the app is signed in). A page an activity
+   * opened goes back through the same activity, and a debug session through the debug card, on this page's port.
+   */
+  Session.prototype.relaunch = function () {
+    if (this.host === 'app' && hostBridge({ type: 'relaunch' })) return;
+    var r = this._r, query = [];
+    if (!r.app || !r.portalId) return;
+    function add(name, value) { if (value !== undefined && value !== null && value !== '') query.push(name + '=' + encodeURIComponent(String(value))); }
+    if (r.portalId === DEBUG_PORTAL || r.context) add('ws', r.workspaceId);
+    if (r.portalId === DEBUG_PORTAL) add('port', global.location.port || (global.location.protocol === 'https:' ? '443' : '80'));
+    if (r.context) {
+      add('module', r.context.moduleId);
+      add('activity', r.context.activityId);
+      add('entry', r.context.entryId);
+    }
+    global.location.assign(r.app + '/#/portal/' + encodeURIComponent(r.portalId) + (query.length ? '?' + query.join('&') : ''));
+  };
+
+  /**
+   * The page's work is done: an activity page calls this after its submit, with the entry it saved. In the app the
+   * page then closes (the bridge carries { type: 'done', entryId }, a string or null); on the web the tab closes, and
+   * where the browser keeps it open the page says it can be closed. This tab forgets the session ('ended', 'done').
+   */
+  Session.prototype.done = function (result) {
+    var entryId = result && result.entryId !== undefined && result.entryId !== null && result.entryId !== '' ? String(result.entryId) : null;
+    if (this.host === 'app' && hostBridge({ type: 'done', entryId: entryId })) {
+      this._end('done');
+      return;
+    }
+    this._end('done');
+    try { global.close(); } catch (e) { /* not script-opened */ }
+    setTimeout(function () { if (!global.closed) showDoneNote(); }, 300);
+  };
+
+  /** Opens an outside https link (the app sends it to the system browser). */
+  Session.prototype.openExternal = function (url) {
+    if (!/^https:\/\//i.test(String(url))) return;
+    if (this.host === 'app' && hostBridge({ type: 'openExternal', url: String(url) })) return;
+    global.open(String(url), '_blank', 'noopener');
+  };
+
+  /** Forgets this tab's session (the page's own sign-out). The server session runs out on its own. */
+  Session.prototype.end = function () {
+    this._end('page_ended');
+  };
+
+  Session.prototype._end = function (reason) {
+    if (this._ended) return;
+    this._ended = true;
+    if (this._timer) clearTimeout(this._timer);
+    writeStored(null);
+    this._emit('ended', reason);
+  };
+
+  // ---- 4. start ----
+  var current = null;
+
+  function start(options) {
+    options = options || {};
+    if (current && !current._ended) return Promise.resolve(current);
+    current = null;
+    var apiHosts = API_HOSTS.concat(options.apiHosts || []);
+    var appHosts = APP_HOSTS.concat(options.appHosts || []);
+    api.lastError = null;
+
+    if (launch) {
+      var code = launch.code;
+      var apiBase = allowed(launch.api, apiHosts);
+      var appBase = allowed(launch.app, appHosts) || '';
+      var host = launch.host === 'app' ? 'app' : 'web';
+      launch = null;
+      if (!apiBase) {
+        api.lastError = 'api_not_allowed';
+        return Promise.resolve(null);
+      }
+      return tokenCall(apiBase, code).then(function (answer) {
+        if (!answer.ok || !answer.body || !answer.body.access_token) {
+          api.lastError = (answer.body && answer.body.error) || 'exchange_refused';
+          return null;
+        }
+        var record = recordFrom(answer, { api: apiBase, app: appBase, host: host });
+        writeStored(record);
+        current = new Session(record);
+        return current;
+      }, function () {
+        api.lastError = 'unreachable';
+        return null;
+      });
+    }
+
+    var stored = readStored();
+    if (stored && stored.v === RECORD_VERSION && allowed(stored.api, apiHosts)
+      && (!stored.sessionEnd || stored.sessionEnd > Date.now())) {
+      current = new Session(stored);
+      if (stored.exp - Date.now() < 30000) {
+        return current.refresh().then(function () { return current; }, function () { current = null; return null; });
+      }
+      return Promise.resolve(current);
+    }
+
+    writeStored(null);
+    api.lastError = 'no_launch';
+    return Promise.resolve(null);
+  }
+
+  var api = {
+    version: VERSION,
+    start: start,
+    /** Why start() resolved to null: no_launch | api_not_allowed | exchange_refused | invalid_grant | unreachable. */
+    lastError: null,
+    /** The note done() shows on the web when the tab stays open; a page may set it in the reader's language. */
+    doneNote: 'You can close this tab.',
+    /** True when this page load carried a launch code (before start() spends it). */
+    get launching() { return !!launch; }
+  };
+
+  global.InistatePortal = api;
+})(window);
+</script>
+<!-- inistate-portal-sdk:end -->
+<title>Leave overview</title>
+<style>
+  /* Inistate Portal look. The colours are the only per-product choice: change --accent and its two companions. */
+  :root {
+    --accent: #1F6FEB; --accent-ink: #FFFFFF; --accent-soft: #E9F1FE;
+    --ink: #1F2933; --muted: #5F6B7A; --line: #E3E7ED; --bg: #F5F6F8; --card: #FFFFFF;
+    --ok: #2A7B50; --ok-soft: #E7F4EC; --bad: #B42318; --bad-soft: #FDECEA; --warn: #8A6116; --warn-soft: #FBF3E2;
+    --radius: 12px; --gap: 16px;
+    --safe-top: env(safe-area-inset-top, 0px); --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-left: env(safe-area-inset-left, 0px); --safe-right: env(safe-area-inset-right, 0px);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: var(--ink); background: var(--bg);
+    -webkit-text-size-adjust: 100%;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  .side { padding-left: max(var(--gap), var(--safe-left)); padding-right: max(var(--gap), var(--safe-right)); }
+
+  /* the top band */
+  .band { background: var(--accent); color: var(--accent-ink); padding-top: calc(12px + var(--safe-top)); padding-bottom: 12px; }
+  .band-in { max-width: 1120px; margin: 0 auto; display: flex; align-items: center; gap: 12px; min-height: 36px; }
+  .band h1 { margin: 0; font-size: 18px; font-weight: 650; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .band .who { font-size: 13px; opacity: .85; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  main { max-width: 1120px; margin: 0 auto; padding-top: var(--gap); padding-bottom: calc(96px + var(--safe-bottom)); }
+
+  /* the portal's states: <body data-state="…"> shows one screen, or the page's own content */
+  [data-screen] { display: none; }
+  body[data-state="loading"] [data-screen="loading"],
+  body[data-state="outside"] [data-screen="outside"],
+  body[data-state="ended"] [data-screen="ended"],
+  body[data-state="no-access"] [data-screen="no-access"] { display: block; }
+  body[data-state="ready"] [data-screen="content"], body[data-state="empty"] [data-screen="content"],
+  body[data-state="saving"] [data-screen="content"], body[data-state="saved"] [data-screen="content"],
+  body[data-state="refused"] [data-screen="content"] { display: block; }
+  [data-when] { display: none; }
+  body[data-state="empty"] [data-when~="empty"], body[data-state="saving"] [data-when~="saving"],
+  body[data-state="saved"] [data-when~="saved"], body[data-state="refused"] [data-when~="refused"] { display: block; }
+  body[data-state="empty"] [data-unless~="empty"] { display: none; }
+
+  .screen { max-width: 520px; margin: 12vh auto 0; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 28px 24px; text-align: center; }
+  .screen h2 { margin: 0 0 8px; font-size: 19px; }
+  .screen p { margin: 0 0 12px; color: var(--muted); }
+  .spinner { width: 28px; height: 28px; margin: 0 auto 12px; border-radius: 50%; border: 3px solid var(--accent-soft); border-top-color: var(--accent); animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+
+  /* figure tiles */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: var(--gap); }
+  .tile { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; min-width: 0; }
+  .tile .label { color: var(--muted); font-size: 13px; }
+  .tile .figure { font-size: 26px; font-weight: 650; line-height: 1.2; margin-top: 4px; overflow-wrap: anywhere; }
+
+  /* cards */
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: var(--gap); min-width: 0; }
+  .cardhead { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .cardhead h2 { margin: 0; font-size: 16px; flex: 1; min-width: 0; }
+  .cardbody { padding: 16px; }
+  .empty { padding: 28px 16px; text-align: center; color: var(--muted); }
+  .note { color: var(--muted); font-size: 13px; padding: 0 16px 14px; }
+
+  /* a list: a table on a wide screen, one card per row on a phone */
+  .rows { width: 100%; border-collapse: collapse; }
+  .rows th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  .rows td { padding: 12px 16px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+  .rows tr:last-child td { border-bottom: 0; }
+  @media (max-width: 640px) {
+    .rows thead { display: none; }
+    .rows, .rows tbody, .rows tr, .rows td { display: block; width: 100%; }
+    .rows tr { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    .rows tr:last-child { border-bottom: 0; }
+    .rows td { padding: 2px 0; border: 0; display: flex; gap: 12px; justify-content: space-between; }
+    .rows td::before { content: attr(data-label); color: var(--muted); font-size: 13px; flex: none; }
+  }
+
+  /* status pills */
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+
+  /* forms */
+  .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px 16px; }
+  .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .field label { font-size: 13px; font-weight: 600; }
+  .field .req { color: var(--bad); }
+  .field input, .field select, .field textarea { width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  .field textarea { min-height: 88px; resize: vertical; }
+  .field input[type="file"] { padding: 8px; }
+  .field input:focus, .field select:focus, .field textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  .field .hint { color: var(--muted); font-size: 12px; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px 16px; margin: 0 0 16px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+  .facts div { min-width: 0; }
+  .facts dt { color: var(--muted); font-size: 12px; }
+  .facts dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+
+  /* banners: saving, saved, refused */
+  .banner { border-radius: var(--radius); padding: 12px 16px; margin-bottom: var(--gap); }
+  .banner.saving { background: var(--accent-soft); color: var(--accent); }
+  .banner.saved { background: var(--ok-soft); color: var(--ok); }
+  .banner.refused { background: var(--bad-soft); color: var(--bad); }
+
+  /* the submit bar: along the bottom, clear of the phone's home indicator */
+  .submitbar { position: fixed; left: 0; right: 0; bottom: 0; background: rgba(255,255,255,.96); border-top: 1px solid var(--line); padding-top: 12px; padding-bottom: calc(12px + var(--safe-bottom)); display: none; }
+  body[data-form] .submitbar { display: block; }
+  body:not([data-state="ready"]):not([data-state="empty"]):not([data-state="saving"]):not([data-state="saved"]):not([data-state="refused"]) .submitbar { display: none; }
+  .submitbar-in { max-width: 1120px; margin: 0 auto; display: flex; gap: 12px; justify-content: flex-end; align-items: center; }
+  .btn { min-height: 44px; padding: 10px 18px; border-radius: 8px; border: 1px solid var(--line); background: #fff; cursor: pointer; font-weight: 600; }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .btn[disabled] { opacity: .55; cursor: default; }
+  .btn.link { border: 0; background: none; color: var(--accent); padding: 6px 8px; min-height: 36px; }
+  @media (max-width: 480px) { .submitbar-in .btn.primary { flex: 1; } }
+
+  details.tech { margin-top: 12px; font-size: 12px; color: var(--muted); text-align: left; }
+  details.tech pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0 0; }
+</style>
+</head>
+<body data-state="loading">
+<header class="band side">
+  <div class="band-in">
+    <h1 id="title" data-t="title"></h1>
+    <div class="who" id="who"></div>
+  </div>
+</header>
+
+<main class="side">
+  <!-- The portal's states (the kit's Portal.state). Keep them: the checks look for each one. -->
+  <section class="screen" data-screen="loading" aria-live="polite">
+    <div class="spinner" aria-hidden="true"></div>
+    <p data-t="loading"></p>
+  </section>
+  <section class="screen" data-screen="outside">
+    <h2 data-t="outside.title"></h2>
+    <p id="outside-body" data-t="outside.body"></p>
+    <details class="tech"><summary data-t="tech"></summary><pre id="outside-why"></pre></details>
+  </section>
+  <section class="screen" data-screen="ended">
+    <h2 data-t="ended.title"></h2>
+    <p data-t="ended.body"></p>
+    <button class="btn primary" type="button" id="reopen" data-t="reopen"></button>
+  </section>
+  <section class="screen" data-screen="no-access">
+    <h2 data-t="noAccess.title"></h2>
+    <p id="no-access-body"></p>
+  </section>
+
+  <!-- PAGE: the page's own content, shown while the state is ready, empty, saving, saved or refused.
+       /portal try replaces what is inside with the design; data-when / data-unless pick what each state shows. -->
+  <div data-screen="content">
+    <div class="banner saving" data-when="saving" data-t="saving" role="status"></div>
+    <div class="banner saved" data-when="saved" data-t="saved" role="status"></div>
+    <div class="banner refused" data-when="refused" id="refused" role="alert"></div>
+
+    <section class="tiles" id="tiles" aria-label="Figures"></section>
+
+    <section class="card" id="list-card" aria-labelledby="list-h">
+      <div class="cardhead"><h2 id="list-h" data-t="list.title"></h2><button class="btn link" type="button" id="read-again" data-t="readAgain"></button></div>
+      <div id="list" data-unless="empty"></div>
+      <div class="empty" data-when="empty" data-t="list.empty"></div>
+    </section>
+
+    <form class="card" id="form-card" aria-labelledby="form-h" novalidate>
+      <div class="cardhead"><h2 id="form-h" data-t="form.title"></h2></div>
+      <div class="cardbody">
+        <dl class="facts" id="facts" hidden></dl>
+        <div class="fields" id="fields"></div>
+      </div>
+    </form>
+  </div>
+</main>
+
+<div class="submitbar side">
+  <div class="submitbar-in">
+    <button class="btn primary" type="submit" form="form-card" id="submit" data-action="submit" data-t="form.submit"></button>
+  </div>
+</div>
+
+<!-- inistate-portal-kit:begin: the /portal kit's helpers (session, states, reads, submits). Keep them as they are. -->
+<script>
+(function (global) {
+  'use strict';
+
+  // The only calls the page makes; anything else is refused before it is sent (the CSP is the second lock).
+  // Reads go through /v1/list. Writes go through the app's own activity calls, as the Inistate app's form does.
+  var CALLS = { 'POST /v1/list': true, 'GET /api/Workspace/{id}': true, 'POST /api/activity/form': true, 'POST /api/activity/': true, 'POST /api/fileupload': true };
+  var PAGE_SIZE_MAX = 500;   // the most /v1/list gives per call
+  var PAGES_MAX = 10;
+  var STATES = ['loading', 'ready', 'empty', 'saving', 'saved', 'refused', 'no-access', 'ended', 'outside'];
+  // Inistate wraps an error raised inside an activity once per level it passed through; the reader needs the inside.
+  var WRAPPING = /^(?:Script\s*:|Automation(?:\s+error)?\s*:|Activity Service [^:]*:|Errors\s*:|One or more fields failed validation\.?\s*:)\s*/i;
+
+  var session = null, workspace = null, forms = {}, wholeRefused = {}, listeners = [];
+
+  function problem(kind, message) {
+    var error = new Error(message);
+    error.kind = kind;   // ended | no_access | not_found | refused | failed
+    return error;
+  }
+  function kindOf(status) {
+    if (status === 401) return 'ended';
+    if (status === 403) return 'no_access';
+    if (status === 404) return 'not_found';
+    if (status === 400 || status === 409 || status === 422) return 'refused';
+    return 'failed';
+  }
+  function copy(from, to) { Object.keys(from || {}).forEach(function (k) { to[k] = from[k]; }); return to; }
+  function clone(value) { return value === undefined ? undefined : JSON.parse(JSON.stringify(value)); }
+  function isFile(value) { return typeof Blob !== 'undefined' && value instanceof Blob; }
+  // { id, value } (as a read gives a Module or User field) or { id, name }: a link to an entry or a member
+  function isLink(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value) && !isFile(value) && present(value.id);
+  }
+  function present(value) { return value !== undefined && value !== null && value !== ''; }
+
+  // ---- the screens ----
+  function setState(name, detail) {
+    if (STATES.indexOf(name) < 0) throw new Error('No such state: ' + name);
+    document.body.setAttribute('data-state', name);
+    Portal.state = name;
+    Portal.detail = detail || null;
+    listeners.forEach(function (fn) { try { fn(name, detail || null); } catch (e) { /* the page's own */ } });
+  }
+
+  // An error from a read or a submit, on the screen it belongs to. Answers false when the page should say it itself.
+  function fail(error, what) {
+    if (error && error.kind === 'ended') { setState('ended', { reason: error.message }); return true; }
+    if (error && error.kind === 'no_access') { setState('no-access', { what: what || null, message: error.message }); return true; }
+    return false;
+  }
+
+  // ---- the Inistate API ----
+  function call(path, body, method) {
+    method = method || 'POST';
+    var kind = method + ' ' + path.replace(/^\/api\/Workspace\/\d+$/, '/api/Workspace/{id}');
+    if (!CALLS[kind]) return Promise.reject(problem('failed', 'This page does not call ' + path + '.'));
+    if (!session) return Promise.reject(problem('ended', 'Open this page from Inistate.'));
+    return session.fetch(path, { method: method, body: body }).then(function (response) {
+      return response.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+        if (response.ok) return data;
+        var message = data && typeof data === 'object' ? (data.message || data.Message || data.error || data.ExceptionMessage) : data;
+        var error = problem(kindOf(response.status), String(message || ('Inistate answered ' + response.status + '.')));
+        error.status = response.status;
+        error.fields = data && Array.isArray(data.details) ? data.details : [];   // a refused form names its fields here (422)
+        throw error;
+      });
+    }, function (error) {
+      throw problem(error && error.message === 'ended' ? 'ended' : 'failed', error && error.message === 'ended' ? 'Your session has ended.' : 'Inistate could not be reached.');
+    });
+  }
+
+  // What a refusal says, without Inistate's wrapping.
+  function readable(error) {
+    var text = String((error && error.message) || '').trim(), before;
+    var named = (error && error.fields || []).map(function (d) { return d && (d.message || d.field); }).filter(Boolean);
+    if (named.length && (!text || /^One or more fields failed validation\.?$|^Validation failed$/i.test(text))) text = named.join('; ');
+    do { before = text; text = text.replace(WRAPPING, '').trim(); } while (text !== before);
+    return text || String((error && error.message) || '');
+  }
+
+  /**
+   * Reads a module through /v1/list. read = { module, listing, fields, filters, state, documentId, pageSize, pages, whole }
+   * - A named listing gives only its own columns: ask only for fields that listing shows.
+   * - whole: { state, filters } reads the module whole, which gives every field but is allowed to a workspace admin
+   *   only. It repeats the listing's own filter. Anyone else is refused, and the read falls back to the listing.
+   * - pageSize is at most 500; pages (1 by default, at most 10) reads that many pages.
+   * - A 403 is error.kind 'no_access' (Portal.fail shows the no-access screen); a missing module is 'not_found'.
+   * Answers { rows: [{ entryId, documentId, state, data: { field: value } }], totalItems, hasMore, whole }.
+   */
+  function list(read) {
+    var size = Math.min(Math.max(Number(read.pageSize) || 50, 1), PAGE_SIZE_MAX);
+    var pages = Math.min(Math.max(Number(read.pages) || 1, 1), PAGES_MAX);
+    var whole = !!read.whole && !wholeRefused[read.module];
+    var rows = [], page = 0, total = null;
+    function request() {
+      var body = { module: read.module, pageSize: size, currentPage: page }, filters = copy(read.filters, {});
+      if (read.fields) body.fields = read.fields.slice();
+      if (whole) {
+        if (read.whole.state) body.state = read.whole.state;
+        copy(read.whole.filters, filters);
+      } else {
+        if (read.listing) body.listing = read.listing;
+        if (read.state) body.state = read.state;
+      }
+      if (read.documentId) body.documentId = String(read.documentId);
+      if (Object.keys(filters).length) body.filters = filters;
+      return body;
+    }
+    function next() {
+      return call('/v1/list', request()).then(function (answer) {
+        var got = (answer && answer.list) || [];
+        rows = rows.concat(got);
+        page += 1;
+        if (total === null && answer && typeof answer.totalItems === 'number') total = answer.totalItems;
+        if (answer && answer.hasMore && got.length && page < pages) return next();
+        return { rows: rows, totalItems: total === null ? rows.length : total, hasMore: !!(answer && answer.hasMore), whole: whole };
+      });
+    }
+    return next().catch(function (error) {
+      if (whole && page === 0 && (error.kind === 'no_access' || /restricted|not accessible/i.test(error.message))) {
+        wholeRefused[read.module] = true;
+        whole = false;
+        return next();
+      }
+      throw error;
+    });
+  }
+
+  // A module's id in this workspace, by its name: the workspace's menus, as the Inistate app loads them (a module of
+  // this workspace before one shared in from another).
+  function moduleId(name) {
+    workspace = workspace || call('/api/Workspace/' + encodeURIComponent(String(session.workspace.id)), undefined, 'GET');
+    return workspace.then(function (answer) {
+      var want = String(name).trim().toLowerCase(), found = [];
+      (function walk(items) {
+        (Array.isArray(items) ? items : []).forEach(function (item) {
+          if (!item || typeof item !== 'object') return;
+          if (item.module && String(item.name || '').trim().toLowerCase() === want) found.push(item);
+          walk(item.children);
+        });
+      })(answer && answer.menus);
+      var own = found.filter(function (item) { return item.currentWorkspace !== false; })[0] || found[0];
+      if (!own) throw problem('not_found', name + ' is not in this workspace.');
+      return String(own.module);
+    });
+  }
+
+  function walkFields(node, found) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(function (x) { walkFields(x, found); }); return; }
+    if (node.fieldName && (node.displayName || node.name) && node.id) found.push(node);
+    // sections and tabs nest their own design; a table's columns sit in "fields" and are read with the table
+    ['rows', 'items', 'design', 'tabs'].forEach(function (k) { if (node[k]) walkFields(node[k], found); });
+  }
+  // The form's read, as the app makes it. With no listing the server looks for the entry inside the person's own
+  // listings; an entry outside all of them (a Done job, to someone whose listings hold only open ones) is refused, and
+  // a workspace admin then reads it as the app's Everything view does (the server allows "everything" to them only).
+  // The entry is named as locusId too, as the app does: a server without the 2026-11 entryId fix loads the entry's values
+  // only for locusId; with entryId alone it answers no current values, and a submit then clears every field it leaves out.
+  function readForm(module, activityId, entryId) {
+    function body(listingId) { return { moduleId: module, listingId: listingId, activityId: activityId, entryId: entryId, locusId: entryId === null ? null : String(entryId), query: null }; }
+    return call('/api/activity/form', body(null)).catch(function (error) {
+      if (entryId === null || error.kind !== 'refused' || !/unauthori[sz]ed to access this entry|no accessible listing/i.test(error.message)) throw error;
+      return call('/api/activity/form', body('everything')).catch(function (again) {
+        throw /everything not accessible/i.test(again.message) ? error : again;   // not an admin: the first reason stands
+      });
+    });
+  }
+
+  function named(list, name) {
+    var want = String(name).trim().toLowerCase();
+    return list.filter(function (x) { return String(x.displayName || x.name || '').trim().toLowerCase() === want; })[0] || null;
+  }
+
+  /**
+   * The form of an activity, as the Inistate app loads it (POST /api/activity/form): its fields and current values.
+   * target = s.context ({ moduleId, activityId, entryId }) on a page an activity opened, or
+   *          { module: 'Name', activityId: 'create' | '<activity id>', entryId } on a menu page.
+   * Answers { moduleId, activityId, entryId, field(name), value(name), values }.
+   */
+  function form(target) {
+    var activityId = String((target && target.activityId) || 'create');
+    var entryId = target && present(target.entryId) ? target.entryId : null;
+    var id = target && present(target.moduleId) ? Promise.resolve(String(target.moduleId)) : moduleId(target.module);
+    return id.then(function (module) {
+      var key = module + '|' + activityId + '|' + (entryId === null ? '' : entryId);
+      forms[key] = forms[key] || readForm(module, activityId, entryId)
+        .then(function (answer) {
+          var classification = answer && answer.classificationForm;
+          if (!classification || !classification.design) throw problem('failed', 'Inistate gave no form for this activity.');
+          var elements = [];
+          walkFields(classification.design, elements);
+          var values = classification.default || {};
+          return {
+            moduleId: module, activityId: activityId, entryId: entryId, elements: elements,
+            values: values,
+            field: function (name) { return named(elements, name); },
+            value: function (name) { var f = named(elements, name); return f ? values[f.fieldName] : undefined; }
+          };
+        }, function (error) { delete forms[key]; throw error; });
+      return forms[key];
+    });
+  }
+
+  function upload(module, element, file) {
+    var body = new FormData();
+    body.append('vectorId', String(module));
+    body.append('fieldName', element.fieldName);
+    body.append('fieldId', element.id);
+    body.append('file', file, file.name || 'file');
+    return call('/api/fileupload', body).then(function (data) {
+      if (!data || !(data.url || data.path)) throw problem('failed', 'The file could not be uploaded.');
+      return { path: data.url || data.path, name: data.filename || data.name || file.name, size: data.size || file.size };
+    });
+  }
+
+  function tableRow(element, row) {
+    var columns = element.fields || element.columns || [], out = { id: row.id || (global.crypto && global.crypto.randomUUID ? global.crypto.randomUUID() : 'row-' + Date.now() + '-' + Math.floor(Math.random() * 1e6)) };
+    Object.keys(row).forEach(function (name) {
+      if (name === 'id') return;
+      var column = named(columns, name);
+      if (!column) throw problem('refused', element.displayName + ' has no column "' + name + '".');
+      out[column.fieldName] = row[name];
+    });
+    return out;
+  }
+
+  function entryIdOf(answer) {
+    if (!answer || typeof answer !== 'object') return null;
+    var id = answer.entryId !== undefined ? answer.entryId : answer.EntryId;
+    var ids = answer.entryIds || answer.EntryIds;
+    if (!present(id) && Array.isArray(ids) && ids.length) id = ids[0];
+    return present(id) ? String(id) : null;
+  }
+
+  /**
+   * Submits an activity through the app's own calls, as the Inistate app's form does: the form first
+   * (POST /api/activity/form), files through POST /api/fileupload, then POST /api/activity/. Rights, required fields,
+   * state rules and automations are those of the standard form: the server decides.
+   * target: as for form(). payload: values by the field names shown in Inistate; a File (or Blob) is uploaded first;
+   * a table is an array of rows by its column names; a link to an entry or a member is { id, value }, as a read
+   * gives it. Fields the payload leaves out keep the form's current values.
+   * Answers { entryId, answer }. A refusal is error.kind 'refused' (Portal.readable(error) says why).
+   */
+  function submit(target, payload) {
+    return form(target).then(function (f) {
+      var data = clone(f.values) || {}, uploads = [];
+      Object.keys(payload || {}).forEach(function (name) {
+        var element = f.field(name), value = payload[name];
+        if (!element) throw problem('refused', 'The form has no field "' + name + '".');
+        if (isFile(value)) {
+          uploads.push(upload(f.moduleId, element, value).then(function (saved) { data[element.fieldName] = saved; }));
+        } else if (Array.isArray(value) && value.length && value.every(isFile)) {
+          uploads.push(Promise.all(value.map(function (file) { return upload(f.moduleId, element, file); })).then(function (saved) { data[element.fieldName] = saved; }));
+        } else if (Array.isArray(value) && (element.fields || element.columns)) {
+          data[element.fieldName] = value.map(function (row) { return tableRow(element, row); });
+        } else if (isLink(value)) {
+          // a link to another module's entry (or a member): its text, with its id beside it, as the app's form
+          // keeps them (<field>Id, and <field>Username for a member)
+          data[element.fieldName] = present(value.value) ? value.value : (present(value.name) ? value.name : null);
+          data[element.fieldName + 'Id'] = value.id;
+          if (present(value.username)) data[element.fieldName + 'Username'] = value.username;
+        } else {
+          data[element.fieldName] = value;
+        }
+      });
+      return Promise.all(uploads).then(function () {
+        return call('/api/activity/', { moduleId: String(f.moduleId), activityId: f.activityId, payload: data, entryIds: f.entryId === null ? [] : [f.entryId] });
+      }).then(function (answer) {
+        Object.keys(forms).forEach(function (key) { if (key.indexOf(f.moduleId + '|') === 0) delete forms[key]; });   // values changed
+        return { entryId: entryIdOf(answer) || (f.entryId === null ? null : String(f.entryId)), answer: answer };
+      });
+    });
+  }
+
+  /** Starts the page: its session, or the outside screen. Answers the session, or null. */
+  function start() {
+    setState('loading');
+    return InistatePortal.start().then(function (s) {
+      if (!s) { setState('outside', { reason: InistatePortal.lastError }); return null; }
+      session = s;
+      Portal.session = s;
+      s.on('ended', function (reason) { if (reason !== 'done') setState('ended', { reason: reason }); });
+      return s;
+    });
+  }
+
+  var Portal = {
+    start: start, list: list, form: form, submit: submit, moduleId: moduleId,
+    setState: setState, fail: fail, readable: readable,
+    onState: function (fn) { listeners.push(fn); },
+    /** "Open again from Inistate": a fresh launch, back through the activity or the debug card where that opened it. */
+    reopen: function () { if (session) session.relaunch(); },
+    state: 'loading', detail: null, session: null
+  };
+  global.Portal = Portal;
+})(window);
+</script>
+<!-- inistate-portal-kit:end -->
+
+<!-- PAGE: what this page shows and does. /portal try writes CONFIG from portal.json and builds the design around it. -->
+<script>
+(function () {
+  'use strict';
+
+  var CONFIG = {
+    // the module read whole by a workspace admin (every field), through its listing by everyone else
+    list: { module: 'Leave Requests', listing: 'Pending approval', fields: ['Employee', 'Leave Type', 'From', 'To', 'Days'],
+            whole: { state: 'Pending' }, pageSize: 200, pages: 3 },
+    tiles: [{ label: 'tile.pending', figure: 'count' }, { label: 'tile.days', sum: 'Days' }],
+    form: null
+  };
+
+  // All wording, for one language. A page in another language changes these only.
+  var T = {
+    title: 'Leave overview', loading: 'Loading…', tech: 'Technical details',
+    'outside.title': 'Open again from Inistate',
+    'outside.body': 'This page has no sign-in of its own. It signs you in when you open it from Inistate, on the web or in the mobile app.',
+    'outside.context': 'This page opens from an activity in Inistate. Open it from there.',
+    'ended.title': 'Your session has ended', 'ended.body': 'Open the page again from Inistate to carry on.', reopen: 'Open again from Inistate',
+    'noAccess.title': 'No access', 'noAccess.body': 'You do not have access to {0}.', 'noAccess.this': 'this page',
+    'list.title': 'Waiting for approval', 'list.empty': 'No leave is waiting for approval.', readAgain: 'Read again', 'col.status': 'Status',
+    'tile.pending': 'Requests waiting', 'tile.days': 'Days asked for',
+    'form.title': '', 'form.submit': '', 'form.required': 'Fill in {0}.',
+    saving: 'Saving…', saved: 'Saved.', refused: 'Inistate did not save it: {0}', failed: 'Something went wrong: {0}'
+  };
+  function t(key) {
+    var args = arguments, text = T[key] === undefined ? key : T[key];
+    return text.replace(/\{(\d)\}/g, function (all, i) { var v = args[Number(i) + 1]; return v === undefined || v === null ? '' : String(v); });
+  }
+  function $(id) { return document.getElementById(id); }
+  function el(tag, attrs, text) {
+    var node = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) { if (attrs[k] !== undefined && attrs[k] !== null && attrs[k] !== false) node.setAttribute(k, attrs[k] === true ? '' : attrs[k]); });
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+  function display(value) {
+    if (value === undefined || value === null || value === '') return '—';
+    if (Array.isArray(value)) return value.map(display).join(', ');
+    if (typeof value === 'object') return value.name || value.displayName || value.label || value.value || JSON.stringify(value);
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}(T|$)/.test(value)) {
+      var d = new Date(value);
+      if (!isNaN(d)) return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+    return String(value);
+  }
+
+  document.querySelectorAll('[data-t]').forEach(function (node) { node.textContent = t(node.getAttribute('data-t')); });
+  document.title = t('title');
+  if (!CONFIG.list) $('list-card').remove();
+  if (!CONFIG.list || !(CONFIG.tiles || []).length) $('tiles').remove();
+  if (!CONFIG.form) { $('form-card').remove(); document.querySelector('.submitbar').remove(); } else document.body.setAttribute('data-form', '');
+
+  var session = null, target = null;
+
+  // ---- the list ----
+  function readList() {
+    if (!CONFIG.list) return Promise.resolve(null);
+    return Portal.list(CONFIG.list).then(function (answer) {
+      var table = el('table', { class: 'rows' }), head = el('tr'), body = el('tbody');
+      CONFIG.list.fields.forEach(function (name) { head.appendChild(el('th', { scope: 'col' }, name)); });
+      head.appendChild(el('th', { scope: 'col' }, t('col.status')));
+      answer.rows.forEach(function (row) {
+        var tr = el('tr');
+        CONFIG.list.fields.forEach(function (name) { tr.appendChild(el('td', { 'data-label': name }, display((row.data || {})[name]))); });
+        var status = el('td', { 'data-label': t('col.status') });
+        if (row.state) status.appendChild(el('span', { class: 'pill' }, row.state));
+        tr.appendChild(status);
+        body.appendChild(tr);
+      });
+      var thead = el('thead');
+      thead.appendChild(head);
+      table.appendChild(thead);
+      table.appendChild(body);
+      $('list').replaceChildren(table);
+      if ($('tiles')) $('tiles').replaceChildren.apply($('tiles'), CONFIG.tiles.map(function (spec) { return tile(t(spec.label), figure(spec, answer)); }));
+      return answer;
+    });
+  }
+  function figure(spec, answer) {
+    if (spec.sum) return answer.rows.reduce(function (total, row) { return total + (Number((row.data || {})[spec.sum]) || 0); }, 0).toLocaleString();
+    if (spec.figure === 'shown') return answer.rows.length.toLocaleString();
+    return answer.totalItems.toLocaleString() + (answer.hasMore && spec.figure !== 'count' ? '+' : '');
+  }
+  function tile(label, figure) {
+    var node = el('div', { class: 'tile' });
+    node.appendChild(el('div', { class: 'label' }, label));
+    node.appendChild(el('div', { class: 'figure' }, figure));
+    return node;
+  }
+
+  // ---- the form ----
+  function inputFor(field, index) {
+    var id = 'f-' + index, input, type = String(field.type || 'Text').toLowerCase();
+    if (field.options && field.options.length) {
+      input = el('select', { id: id });
+      input.appendChild(el('option', { value: '' }, ''));
+      field.options.forEach(function (option) { input.appendChild(el('option', { value: option }, option)); });
+    } else if (type === 'text' && field.multiline) {
+      input = el('textarea', { id: id });
+    } else if (type === 'file' || type === 'image') {
+      input = el('input', { id: id, type: 'file' });
+    } else if (type === 'checkbox' || type === 'boolean' || type === 'yes/no') {
+      input = el('input', { id: id, type: 'checkbox' });
+    } else {
+      input = el('input', { id: id, type: type === 'date' ? 'date' : type === 'number' || type === 'currency' || type === 'decimal' ? 'number' : type === 'email' ? 'email' : 'text' });
+      if (input.type === 'number') { input.setAttribute('step', 'any'); input.setAttribute('inputmode', 'decimal'); }
+    }
+    input.setAttribute('data-field', field.name);
+    if (field.required) { input.required = true; input.setAttribute('aria-required', 'true'); }
+    var wrap = el('div', { class: 'field' }), label = el('label', { for: id }, field.name);
+    if (field.required) label.appendChild(el('span', { class: 'req', 'aria-hidden': 'true' }, ' *'));
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    if (field.hint) wrap.appendChild(el('div', { class: 'hint' }, field.hint));
+    return wrap;
+  }
+  function drawForm(loaded) {
+    var fields = $('fields');
+    fields.replaceChildren();
+    CONFIG.form.fields.forEach(function (field, i) { fields.appendChild(inputFor(field, i)); });
+    var facts = $('facts');
+    facts.replaceChildren();
+    (CONFIG.form.show || []).forEach(function (name) {
+      var pair = el('div');   // one name and its value, so the grid keeps them together
+      pair.appendChild(el('dt', null, name));
+      pair.appendChild(el('dd', null, display(loaded ? loaded.value(name) : undefined)));
+      facts.appendChild(pair);
+    });
+    facts.hidden = !(CONFIG.form.show || []).length;
+  }
+  function payload() {
+    var out = {}, missing = [];
+    CONFIG.form.fields.forEach(function (field) {
+      var input = document.querySelector('[data-field="' + field.name.replace(/"/g, '\\"') + '"]');
+      if (!input) return;
+      var value;
+      if (input.type === 'file') value = input.files && input.files[0] ? input.files[0] : undefined;
+      else if (input.type === 'checkbox') value = input.checked;
+      else if (input.type === 'number') value = input.value === '' ? undefined : Number(input.value);
+      else value = input.value === '' ? undefined : input.value;
+      if (value === undefined) { if (field.required) missing.push(field.name); return; }
+      out[field.name] = value;
+    });
+    return { values: out, missing: missing };
+  }
+
+  $('form-card') && $('form-card').addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (Portal.state === 'saving') return;
+    var collected = payload();
+    if (collected.missing.length) { $('refused').textContent = t('form.required', collected.missing.join(', ')); Portal.setState('refused'); return; }
+    Portal.setState('saving');
+    $('submit').disabled = true;
+    Portal.submit(target, collected.values).then(function (result) {
+      Portal.setState('saved', result);
+      if (CONFIG.form.target === 'context') { session.done({ entryId: result.entryId }); return; }
+      $('form-card').reset();
+      $('submit').disabled = false;
+      return readList().then(function (answer) { if (answer && !answer.rows.length) Portal.setState('empty'); });
+    }).catch(function (error) {
+      $('submit').disabled = false;
+      if (Portal.fail(error, CONFIG.form.target === 'context' ? null : CONFIG.form.target.module)) return;
+      $('refused').textContent = error.kind === 'refused' ? t('refused', Portal.readable(error)) : t('failed', Portal.readable(error));
+      Portal.setState('refused', { message: Portal.readable(error) });
+    });
+  });
+
+  $('read-again') && $('read-again').addEventListener('click', function () { show(); });
+  $('reopen').addEventListener('click', function () { Portal.reopen(); });
+  Portal.onState(function (state, detail) {
+    if (state === 'no-access') $('no-access-body').textContent = t('noAccess.body', (detail && detail.what) || t('noAccess.this'));
+    if (state === 'outside') $('outside-why').textContent = (detail && detail.reason) || '';
+  });
+
+  function show() {
+    var loading = [readList()];
+    if (CONFIG.form) loading.push(Portal.form(target));
+    return Promise.all(loading).then(function (done) {
+      if (CONFIG.form) drawForm(done[1]);
+      Portal.setState(done[0] && !done[0].rows.length ? 'empty' : 'ready');
+    }).catch(function (error) {
+      if (Portal.fail(error, CONFIG.list ? CONFIG.list.module : null)) return;
+      $('refused').textContent = t('failed', Portal.readable(error));
+      Portal.setState('refused', { message: Portal.readable(error) });
+    });
+  }
+
+  Portal.start().then(function (s) {
+    if (!s) return;
+    session = s;
+    $('who').textContent = (s.user && s.user.username) || '';
+    if (CONFIG.form && CONFIG.form.target === 'context') {
+      // opened by an activity: the session says which, on which entry; a launch from the Portals menu has none
+      if (!s.context) { $('outside-body').textContent = t('outside.context'); Portal.setState('outside', { reason: 'no_context' }); return; }
+      target = s.context;
+    } else if (CONFIG.form) {
+      target = CONFIG.form.target;
+    }
+    return show();
+  });
+})();
+</script>
+</body>
+</html>

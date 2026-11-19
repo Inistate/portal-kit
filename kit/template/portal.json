@@ -1,0 +1,27 @@
+{
+  "slug": "requests",
+  "name": "Requests",
+  "icon": "file-alt",
+  "kind": "menu",
+  "server": "production",
+  "workspace": 136,
+  "port": 5173,
+  "visibleTo": "Everyone",
+  "platforms": ["web", "app"],
+  "reads": [
+    {
+      "module": "Requests",
+      "listing": "Open requests",
+      "fields": { "Title": "Text", "Requested By": "Text", "Due Date": "Date", "Priority": "Selection" }
+    }
+  ],
+  "submits": [
+    {
+      "module": "Requests",
+      "activity": "create",
+      "activityId": "create",
+      "fields": { "Title": "Text", "Due Date": "Date", "Priority": "Selection", "Details": "Text" },
+      "required": ["Title"]
+    }
+  ]
+}

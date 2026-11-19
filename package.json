@@ -1,0 +1,12 @@
+{
+  "name": "inistate-portal-kit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A Claude Code skill for building, trying and publishing Inistate portal pages.",
+  "scripts": {
+    "test": "node kit/dev/check.js kit/template && node kit/dev/check.js kit/samples/leave-overview && node kit/dev/check.js kit/samples/claim-approval && node tests/check-serve.js && node tests/check-deploy.js"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.58.2"
+  }
+}

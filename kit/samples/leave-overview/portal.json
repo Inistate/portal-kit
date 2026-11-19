@@ -1,0 +1,29 @@
+{
+  "slug": "leave-overview",
+  "name": "Leave overview",
+  "icon": "calendar",
+  "kind": "menu",
+  "server": "internal",
+  "workspace": 136,
+  "port": 5173,
+  "visibleTo": "Workspace admins",
+  "platforms": [
+    "web",
+    "app"
+  ],
+  "reads": [
+    {
+      "module": "Leave Requests",
+      "listing": "Pending approval",
+      "whole": true,
+      "fields": {
+        "Employee": "Text",
+        "Leave Type": "Selection",
+        "From": "Date",
+        "To": "Date",
+        "Days": "Number"
+      }
+    }
+  ],
+  "submits": []
+}
