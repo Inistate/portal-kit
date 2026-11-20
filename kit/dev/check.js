@@ -24,6 +24,9 @@
 //                 often than once a minute (ten minutes are run on a fake clock), 360 px without sideways scrolling,
 //                 the submit through /api/activity/form, /api/fileupload and /api/activity/ with the session's
 //                 activity and entry, and done() closing the page (web) or telling the app (app)
+//   in a frame    as a workspace's Dashboard shows it in the web app (host 'embed'): ready told to the app, no close
+//                 of the page's own, the ended screen asking the app to launch it again, done() told to the app, and
+//                 the frame never moved; a screenshot at 1280 px (shots/embed-1280.png)
 'use strict';
 
 const http = require('http');
@@ -373,12 +376,28 @@ const WATCH = () => {
   window.setInterval = function (fn, delay) { window.__timers.push({ kind: 'interval', delay: Number(delay) || 0, fn: source(fn) }); return setI.apply(this, arguments); };
 };
 const BRIDGE = () => { window.__host = []; window.InistatePortalHost = { postMessage: m => window.__host.push(JSON.parse(m)) }; };
+// The Inistate web app holding the page in a frame, as a workspace's Dashboard does (SDK v1.2 host 'embed'), on the
+// app's own address: the frame's rules and size as the app sets them. It records every message it hears.
+const DASHBOARD = '/__dashboard';
+const attr = value => String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+const dashboard = src => '<!doctype html><html><head><meta charset="utf-8"><title>Inistate</title><link rel="icon" href="data:,">'
+  + '<style>html, body { margin: 0; height: 100%; } iframe { display: block; border: 0; width: 100%; height: 100%; }</style>'
+  + '<script>window.__messages = []; addEventListener("message", function (e) { var f = document.querySelector("iframe");'
+  + ' window.__messages.push({ data: e.data, origin: e.origin, fromFrame: !!f && e.source === f.contentWindow }); });</script></head>'
+  + '<body><iframe src="' + attr(src) + '" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads"'
+  + ' referrerpolicy="no-referrer"></iframe></body></html>';
 
+// options: app (the mobile app's web view), embed (a frame in the web app: page is the frame, top the app around it),
+// noLaunch, clock, viewport
 async function open(browser, scenario, options) {
   options = options || {};
   const mock = makeMock(scenario);
   const outside = [], requests = [];
+  const host = options.app ? 'app' : options.embed ? 'embed' : 'web';
+  const launch = options.noLaunch ? '' : '#plc=' + encodeURIComponent(mock.launchCode()) + '&api=' + encodeURIComponent(API) + '&app=' + encodeURIComponent(APP) + '&host=' + host;
   const context = await browser.newContext({ viewport: options.viewport || { width: 360, height: 780 }, deviceScaleFactor: 1 });
+  // the app's address framing this PC's page: Chrome asks whether it may reach the local network (a person says yes)
+  if (options.embed) await context.grantPermissions(['local-network-access'], { origin: APP }).catch(() => { /* an older playwright-core: the frame says why */ });
   if (options.clock) await context.clock.install();
   await context.addInitScript(WATCH);
   if (options.app) await context.addInitScript(BRIDGE);
@@ -391,7 +410,10 @@ async function open(browser, scenario, options) {
       if (out.delay) await new Promise(r => setTimeout(r, out.delay));
       return route.fulfill({ status: out.status, contentType: 'application/json; charset=utf-8', headers: { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' }, body: JSON.stringify(out.body) });
     }
-    if (url.origin === APP && req.resourceType() === 'document') return route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>Inistate</title>' });
+    if (url.origin === APP && req.resourceType() === 'document') {
+      if (options.embed && url.pathname === DASHBOARD) return route.fulfill({ status: 200, contentType: 'text/html', body: dashboard(ORIGIN + '/' + launch) });
+      return route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>Inistate</title>' });
+    }
     outside.push(req.method() + ' ' + req.url());
     return route.abort();
   });
@@ -399,10 +421,26 @@ async function open(browser, scenario, options) {
   page.setDefaultTimeout(8000);
   const errors = [];
   page.on('pageerror', e => errors.push(String(e.message || e)));
-  const launch = options.noLaunch ? '' : '#plc=' + encodeURIComponent(mock.launchCode()) + '&api=' + encodeURIComponent(API) + '&app=' + encodeURIComponent(APP) + '&host=' + (options.app ? 'app' : 'web');
+  if (options.embed) {
+    await page.goto(APP + DASHBOARD);
+    const frame = page.frames().find(f => f !== page.mainFrame());
+    return { context, page: frame, top: page, mock, outside, requests, errors };
+  }
   await page.goto(ORIGIN + '/' + launch);
   return { context, page, mock, outside, requests, errors };
 }
+// What the app around an 'embed' frame has heard from it: the messages' data, once there are at least count (or 3 s).
+async function heard(top, count) {
+  await top.waitForFunction(n => window.__messages.length >= n, count || 1, { timeout: 3000 }).catch(() => null);
+  return top.evaluate(() => window.__messages.filter(m => m.fromFrame && m.data && m.data.source === 'inistate-portal').map(m => m.data));
+}
+// A close of the page's own, or a way "Back to Inistate", on the screen: in a frame (and in the app) the app has its own.
+const ownClose = page => page.evaluate(() => Array.from(document.querySelectorAll('button, a, [role="button"]')).filter(n => {
+  const box = n.getBoundingClientRect(), style = getComputedStyle(n);
+  if (!box.width || !box.height || style.visibility === 'hidden') return false;
+  const words = [n.textContent, n.getAttribute('aria-label'), n.getAttribute('title')].map(w => String(w || '').trim()).filter(Boolean);
+  return words.some(w => /^(close|close (this )?(page|tab|portal)|back to inistate|back to the app|[×✕✖])$/i.test(w));
+}).map(n => (n.textContent || n.getAttribute('aria-label') || '').trim()));
 const stateOf = page => page.evaluate(() => document.body.getAttribute('data-state'));
 async function settle(page, states, timeout) {
   try { await page.waitForFunction(list => list.includes(document.body.getAttribute('data-state')), states, { timeout: timeout || 8000 }); } catch (e) { /* reported by the caller */ }
@@ -640,6 +678,53 @@ async function fill(page) {
     if (isActivity) {
       r = await open(browser, Object.assign({}, base, { context: null }));
       check('activity page without an activity: the page says to open it from the activity', await settle(r.page, ['outside', 'ready', 'refused']) === 'outside', await stateOf(r.page));
+      await r.context.close();
+    }
+
+    // i. in a frame of the Inistate web app (SDK v1.2 host 'embed': a portal set as the workspace's Dashboard): the
+    // page signs in and tells the app it is ready, draws no close of its own, and nothing it does moves the frame
+    r = await open(browser, base, { embed: true, viewport: { width: 1280, height: 800 } });
+    state = await settle(r.page, ['ready', 'empty', 'refused', 'no-access', 'ended', 'outside']);
+    check('embed: in the web app\'s frame (the Dashboard) the page signs in and is ready', ['ready', 'empty'].includes(state), state + ' ' + (await visibleText(r.page)).slice(0, 200));
+    check('embed: the session says host embed', (await r.page.evaluate(() => window.Portal && Portal.session && Portal.session.host)) === 'embed');
+    let told = await heard(r.top, 1);
+    check('embed: the app around the frame hears { type: "ready" }', told.length > 0 && told[0].type === 'ready', JSON.stringify(told));
+    check('embed: no close or "Back to Inistate" of the page\'s own (the app has its own)', !(await ownClose(r.page)).length, (await ownClose(r.page)).join(', '));
+    check('embed: no sideways scrolling in the frame', await noSidewaysScroll(r.page), await r.page.evaluate(() => document.documentElement.scrollWidth + ' px wide'));
+    console.log('      ' + await (async () => { const file = path.join(shotDir(), 'embed-1280.png'); await r.top.screenshot({ path: file }); return file; })());
+    check('embed: no request outside Inistate\'s API and the page', !r.outside.length, r.outside.join(' | '));
+    check('embed: nothing moved the frame or the app', r.page.url().startsWith(ORIGIN + '/') && r.top.url() === APP + DASHBOARD, r.page.url() + ' in ' + r.top.url());
+    await r.context.close();
+
+    // the session ended in the frame: the app hears it; "Open again from Inistate" asks the app, and the frame stays
+    r = await open(browser, Object.assign({}, base, { mode: 'ended' }), { embed: true, viewport: { width: 1280, height: 800 } });
+    check('embed: an ended session shows the ended screen in the frame', await settle(r.page, ['ended', 'outside', 'refused', 'no-access', 'ready']) === 'ended', await stateOf(r.page));
+    told = await heard(r.top, 2);
+    check('embed: … and the app hears { type: "ended" }', told.some(m => m.type === 'ended'), JSON.stringify(told));
+    const again = await r.page.$('[data-screen="ended"] button, [data-screen="ended"] a');
+    if (again) {
+      await again.click();
+      told = await heard(r.top, told.length + 1);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      check('embed: "Open again from Inistate" asks the app to launch it again ({ type: "relaunch" })', told.some(m => m.type === 'relaunch'), JSON.stringify(told));
+      check('embed: … and the frame stays where it is', r.page.url().startsWith(ORIGIN + '/') && r.top.url() === APP + DASHBOARD, r.page.url());
+    }
+    check('embed: no message carries a token or a code', !/prt_|plc_|eyJ/.test(JSON.stringify(await r.top.evaluate(() => window.__messages))));
+    await r.context.close();
+
+    // an activity page's done() in the frame: the app is told { type: "done", entryId }; no tab to close, no note
+    if (hasForm && opensFromActivity) {
+      r = await open(browser, formBase, { embed: true, viewport: { width: 1280, height: 800 } });
+      await settle(r.page, ['ready', 'empty']);
+      await fill(r.page);
+      await r.page.click('[data-action="submit"]');
+      await r.top.waitForFunction(() => window.__messages.some(m => m.data && m.data.type === 'done'), null, { timeout: 8000 }).catch(() => null);
+      await new Promise(resolve => setTimeout(resolve, 500));
+      told = await heard(r.top, 2);
+      const expected = context.entryId || '700999';
+      check('done (embed): the app is told { type: "done", entryId }', told.some(m => m.type === 'done' && m.entryId === expected), JSON.stringify(told));
+      check('done (embed): no "You can close this tab" note, and the frame stays where it is',
+        !(await r.page.$('#inistate-portal-done')) && r.page.url().startsWith(ORIGIN + '/') && r.top.url() === APP + DASHBOARD, r.page.url());
       await r.context.close();
     }
   } catch (error) {

@@ -1,6 +1,6 @@
 ---
 name: portal
-description: Build an Inistate portal page from a design, try it live on this PC with real data, and publish it to the workspace (or hand it over for upload). Use for /portal brief, /portal try, /portal deploy and /portal handover, or when asked to make, port, try, publish, deploy, undo or hand over an Inistate portal page (a page members open from Inistate's Portals menu, or that an activity such as Create opens instead of its standard form).
+description: Build an Inistate portal page from a design, try it live on this PC with real data, and publish it to the workspace (or hand it over for upload). Use for /portal brief, /portal try, /portal deploy and /portal handover, or when asked to make, port, try, publish, deploy, undo or hand over an Inistate portal page (a page members open from Inistate's Portals menu, that an activity such as Create opens instead of its standard form, or that the web app shows as the workspace's Dashboard).
 argument-hint: "brief <workspace> <module>… | brief <workspace> <module> --activity <name> | try [--activity <name>] [--entry <id>] | deploy [<slug>] [--undo] | handover [<slug>]"
 ---
 
@@ -10,7 +10,9 @@ A portal page is a static `index.html`, with its own files beside it if it needs
 fonts). `/portal deploy` publishes the folder to the workspace's own host,
 `https://w<workspace>.e.inistate.com/<slug>/v<n>/` (`w<workspace>-test` on test), with a version per publish; an
 older page is one hand-hosted file on `https://e.inistate.com/p/<slug>/index.html`. Members open it from Inistate's
-Portals menu (web: a new tab; mobile app: full screen), or an activity opens it instead of the standard form.
+Portals menu (web: a new tab; mobile app: full screen), or an activity opens it instead of the standard form, or the
+web app shows it in a frame as the workspace's Dashboard (a published portal on SDK v1.2+, picked in Settings ›
+Portals › Dashboard).
 Inistate hands the page a single-use launch code after the `#`; the portal SDK inside the page swaps it for the
 member's own session, in one workspace, kept in that tab only.
 
@@ -54,7 +56,7 @@ rights, then the setup links. Inistate fixes the contract between a page and its
   - `template/index.html` and `template/portal.json`: the page to start from.
   - `samples/leave-overview/` (a menu page that reads) and `samples/claim-approval/` (a page an activity opens, which
     submits): worked examples of the same template.
-  - `sdk/portal-v1.js`: the portal SDK v1.1. The page carries it inline; `dev/check.js` fails if the copies differ.
+  - `sdk/portal-v1.js`: the portal SDK v1.2. The page carries it inline; `dev/check.js` fails if the copies differ.
   - `dev/check.js`, `dev/serve.js`, `dev/deploy.js`, `dev/handover.js`, `dev/links.js`, `dev/folder.js`: the checks,
     the local server, the publish, the hand-over, the addresses, and the folder rules Inistate checks again.
 - **Pages:** `D:\portals\<slug>\` holds `index.html` (the page), the page's own files if it has any (`assets\…`),
@@ -93,6 +95,8 @@ person does not say which, ask.
   the page names must be in the folder. Its own scripts and styles keep the same rules as the page.
 - `sessionStorage` only: no `localStorage`, IndexedDB or cookies.
 - One layout from 360 px to desktop, safe-area aware; no sideways scrolling at 360 px.
+- A close or "Back to Inistate" of the page's own only when `s.host === 'web'`; links into Inistate only through
+  `s.openInApp(path)`, shown when `s.can.openInApp` (below).
 - No refresh more often than once a minute; a "Read again" button instead of polling.
 - **Reads** go through `/v1/list` (`Portal.list`). A named listing gives only its own columns.
 - **Writes** go through the app's own activity calls (`Portal.submit`: `/api/activity/form`, `/api/fileupload`,
@@ -123,6 +127,29 @@ person does not say which, ask.
   (`s.context = { moduleId, activityId, entryId }`, bound by the server, never read from the address); without one
   (opened from the Portals menu) it says to open it from the activity. After a save it calls
   `s.done({ entryId })`: the web tab closes (or says it can be closed), and the app closes the page and refreshes.
+
+## Where the page runs: `s.host`
+
+- `web`: a browser tab of its own. The only host where the page may draw its own close or "Back to Inistate".
+- `app`: the mobile app's full-screen web view. The app draws its own ✕; `s.can` says no camera, downloads, print or
+  new tab there.
+- `embed` (SDK v1.2+): a frame inside the Inistate web app, for a portal a workspace admin set as the workspace's
+  **Dashboard** (Settings › Portals › Dashboard). The app draws a slim header around it (the portal's name, Reload,
+  Open in new tab, Standard dashboard), so **draw no close or "Back to Inistate"** there; the checks fail a page that
+  shows one in the frame. `s.close()`, `s.done()`, `s.relaunch()` and an ended session become messages to the app
+  around the frame, which never moves; "Open again from Inistate" (`Portal.reopen()`) asks the app to launch the page
+  again. `s.can` is the web's. Keep 360 px working: a phone browser on the web app gets the same Dashboard.
+- **Only a portal published with SDK v1.2 or later can be the Dashboard.** Settings › Portals › Dashboard lists an
+  older one greyed ("Publish it again with the current kit"). To move a page to v1.2, paste `KIT/sdk/portal-v1.js`
+  between its `inistate-portal-sdk` markers (the checks fail until it is the kit's copy), check it, and
+  `/portal deploy` a new version. Only an uploaded portal shown on the web can be picked; a hand-hosted one cannot.
+
+**Links into Inistate** (a tile that opens a list, a row that opens its entry): `s.openInApp(path)`, where `path` is
+what follows the app's `#`, such as `/list/<module id>` (with the listing's own query) or an entry's own address. In
+`embed` the app around the frame goes there (it takes lists and entries only); on the web a new tab opens it. It
+answers false, doing nothing, for anything but a `/…` path (at most 500 characters, no `//` at the start, no
+backslash, space or control character). Draw such links only when `s.can.openInApp` (false in the mobile app for
+now), and never build `s.app + '/#/…'` addresses by hand. `Portal.moduleId(name)` gives a module's id by its name.
 
 ## /portal brief <workspace> <module>… [--activity <name>]
 
@@ -166,7 +193,8 @@ is the entry to try a custom activity on; Create has none.
    - For `--activity`: `form.target: 'context'`, `show` for the entry's values the person checks, `fields` for what
      they fill in, and `session.done({ entryId })` after the save (the template does this).
 3. **Write `portal.json`** (shape below), names, types and ids only.
-4. **Run the checks** until every one passes, then look at `shots\ready-360.png` and `shots\ready-1280.png`:
+4. **Run the checks** until every one passes, then look at `shots\ready-360.png` and `shots\ready-1280.png` (and
+   `shots\embed-1280.png`, the page in the web app's frame, for a page meant as the Dashboard):
    `node "$HOME/.claude/skills/portal/dev/check.js" <slug>`.
 5. **Start the page** in the background (it keeps running): `node "$HOME/.claude/skills/portal/dev/serve.js" <slug>`,
    adding `--entry=<id>` for a custom activity. It serves `http://localhost:<port>/` (portal.json's port; another
@@ -214,7 +242,10 @@ it again (the marker, the released SDK unchanged, the file types and paths, the 
 4. **When it lands,** `deploy.js` prints the address and the version, writes `portalId`, `version` and `url` into
    `portal.json`, says whether the address serves this `index.html`, and stops. For an activity page it prints the
    **Open with link** (Studio): the person checks and saves it, once; later versions keep it.
-5. **Undo:** `node "$HOME/.claude/skills/portal/dev/deploy.js" <slug> --undo` prints the portal's **Versions link**
+5. **As the Dashboard:** a workspace admin picks the published portal in Settings › Portals › Dashboard (a person's
+   choice there, as with Publish; never through an API). It must be shown on the web and carry SDK v1.2+; everyone
+   the portal is visible to then lands on it, so *Workspace admins* first is the way to try it.
+6. **Undo:** `node "$HOME/.claude/skills/portal/dev/deploy.js" <slug> --undo` prints the portal's **Versions link**
    (Settings › Portals › Versions). Restore on an older version moves the portal back to it, after a confirm. Never
    press Restore without a yes in chat for that version.
 
