@@ -2,8 +2,9 @@
 
 A [Claude Code](https://claude.com/claude-code) skill for building your own **Inistate portal pages**: dashboards your
 team opens from Inistate's **Portals** menu, and form pages an activity (such as Create or Approve) opens instead of
-its standard form. You describe the page in plain words, Claude builds and checks it, you try it on your own computer
-with your workspace's real data, and you publish it yourself from Inistate's **Settings › Portals**.
+its standard form. A dashboard can also take the place of the web app's standard Dashboard. You describe the page in
+plain words, Claude builds and checks it, you try it on your own computer with your workspace's real data, and you
+publish it yourself from Inistate's **Settings › Portals**.
 
 Every page opens with each member's own Inistate sign-in, so it shows and does only what that person can already see
 and do in Inistate.
@@ -58,6 +59,11 @@ To update later, run `git -C "$env:USERPROFILE\portal-kit" pull`, then the `inst
 Nothing goes live until you press **Publish** yourself. During `/portal try`, anything the page saves is saved for
 real; try pages that write in a test workspace.
 
+To make a published dashboard the workspace's **Dashboard** on the web, pick it in the **Dashboard** card of
+**Settings › Portals** and press **Save**. Only a portal uploaded with **Publish**, shown on the web, and built with
+SDK v1.2 or later (this kit) can be picked; one published with an older kit needs publishing again. While the portal
+is visible to *Workspace admins* only, only they land on it. The mobile app keeps its standard Dashboard.
+
 ## What is in this repository
 
 | Folder | What it holds |
@@ -65,7 +71,7 @@ real; try pages that write in a test workspace.
 | `kit/SKILL.md` | The skill Claude follows |
 | `kit/template/` | The page every portal starts from |
 | `kit/samples/` | Two worked examples: a dashboard that reads (`leave-overview`) and a form page an activity opens (`claim-approval`) |
-| `kit/sdk/portal-v1.js` | The Inistate portal SDK. Pages carry it inline and unchanged; Inistate refuses a page whose copy was edited. |
+| `kit/sdk/portal-v1.js` | The Inistate portal SDK (v1.2). Pages carry it inline and unchanged; Inistate refuses a page whose copy was edited. |
 | `kit/dev/` | The checks, the local server, and the publish helper the skill runs |
 | `tests/` | Checks for the kit itself |
 
